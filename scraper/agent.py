@@ -17,127 +17,108 @@ class Request(object):
         self.description = description
         self.cookies = cookies
 
-    def run(self, agent, queue):
+    def run(self, session, queue, task=True):
+        print('running {}'.format(self.description))
         ##
-        # Modify the agent's cookie state
+        # Modify the session's cookie state
         ##
-        cookiejar = agent.local.auth_cookies.copy()
-        requests.utils.add_dict_to_cookiejar(cookiejar, self.cookies)
-        agent.local.session.cookies = cookiejar
+        requests.utils.add_dict_to_cookiejar(session.cookies, self.cookies)
 
         ##
         # Make the request for the page
         ##
-        page = agent.local.session.request(self.method, self.action, self.payload)
+        page = session.request(self.method, self.action, self.payload)
 
         ##
         # Parse the page
         ##
         try:
-            self.parser(page, self, agent, queue)
+            self.parser(page, self, session, queue)
         except Exception as e:
             # TODO: Make this only fail a limited number of times before giving up
-            print('WARNING: Parsing request {} failed ({})'.format(str(self), str(e)), 
+            print('WARNING: Parsing request {} failed ({})'.format(str(self.description), str(e)), 
                     file=sys.stderr)
-            queue.put(self)
+            # queue.put(self)
 
         ##
         # Mark the task as done
         ##
-        queue.task_done()
+        if task:
+            queue.task_done()
 
 
-class Agent(object):
+LOGIN_URL = 'https://my.queensu.ca/'
+SOLUS_URL = 'https://saself.ps.queensu.ca/psc/saself/EMPLOYEE/HRMS/s/WEBLIB_QU_SSO.FUNCLIB_01.FieldFormula.IScript_SSO?tab=SA_LEARNER_SERVICES.SSS_STUDENT_CENTER.GBL'
 
-    LOGIN_URL = 'https://my.queensu.ca/'
-    SOLUS_URL = 'https://saself.ps.queensu.ca/psc/saself/EMPLOYEE/HRMS/s/WEBLIB_QU_SSO.FUNCLIB_01.FieldFormula.IScript_SSO?tab=SA_LEARNER_SERVICES.SSS_STUDENT_CENTER.GBL'
+def _maybe_continue_page(session, page):
+    """
+    Sometimes requests can land you on a `continue` page
+    Normally this redirects using javascript
+    This simulates the javascript and submits the form
+    """
 
-    def maybe_continue_page(self, page):
-        """
-        Sometimes requests can land you on a `continue` page
-        Normally this redirects using javascript
-        This simulates the javascript and submits the form
-        """
+    soup = BeautifulSoup(page.text)
+    form = soup.find('form')
+    if not form:
+        # Don't need to redirect
+        return page
+    else:
+        action = form.get('action')
+        payload = {}
+        for data in form.find_all('input', type='hidden'):
+            payload[data.get('name')] = data.get('value')
 
-        soup = BeautifulSoup(page.text)
-        form = soup.find('form')
-        if not form:
-            # Don't need to redirect
-            return page
-        else:
-            action = form.get('action')
-            payload = {}
-            for data in form.find_all('input', type='hidden'):
-                payload[data.get('name')] = data.get('value')
+        # Request the redirected page
+        return session.request('POST', action, data=payload)
 
-            # Request the redirected page
-            return self.local.session.request('POST', action, data=payload)
+def _authenticate(session):
+    ##
+    # Load the login page from the server to set initial cookies
+    ##
+    login_page = session.request('GET', LOGIN_URL)
 
-    def authenticate(self):
-        print('Trying to authenticate')
-        print(self.local.session)
-        ##
-        # Load the login page from the server to set initial cookies
-        ##
-        login_page = self.local.session.request('GET', self.LOGIN_URL)
-        print('Login Page')
+    ##
+    # Send the login request
+    ##
+    login_payload = {
+        'j_username': config['SOLUS_NETID'],
+        'j_password': config['SOLUS_PASSWD'],
+        'IDButton': '%C2%A0Log+In%C2%A0'
+    }
+    loggedin_page = session.request('POST', login_page.url, data=login_payload)
+    loggedin_page = _maybe_continue_page(session, loggedin_page)
 
-        ##
-        # Send the login request
-        ##
-        login_payload = {
-            'j_username': config['SOLUS_NETID'],
-            'j_password': config['SOLUS_PASSWD'],
-            'IDButton': '%C2%A0Log+In%C2%A0'
-        }
-        loggedin_page = self.local.session.request('POST', 
-                            login_page.url, data=login_payload)
-        loggedin_page = self.maybe_continue_page(loggedin_page)
-        print('Loggedin Page')
+    ##
+    # Open the SOLUS homepage (performs SSO login)
+    ##
+    solus_page = session.request('GET', SOLUS_URL)
+    solus_page = _maybe_continue_page(session, solus_page)
 
-        ##
-        # Open the SOLUS homepage (performs SSO login)
-        ##
-        solus_page = self.local.session.request('GET', self.SOLUS_URL)
-        solus_page = self.maybe_continue_page(solus_page)
-        print("***** SOLUS PAGE *****")
-        print(solus_page.text)
-        print("***** SOLUS PAGE *****")
-
-    def __call__(self, queue):
-        """ Call the agent object to start processing """
-
-        print('WHAT?')
-        self.local = threading.local()
-
+def agent(queue):
+    try:
         ##
         # Create this Agent's Requests Session
         ##
-        self.local.session = requests.Session()
-        self.local.session.mount('https://', SSLAdapter())
-
-        print('Session Created')
-        print(self)
+        session = requests.Session()
+        session.mount('https://', SSLAdapter())
 
         ##
         # Authenticate with SSO
         ##
-        try:
-            self.authenticate()
-        except:
-            print('???')
-        print('Auth')
-        self.local.auth_cookies = self.local.session.cookies.copy()
-
+        _authenticate(session)
+        auth_cookies = session.cookies.copy()
         print('Authenticated')
 
         ##
         # Process requests off of the stack
         ##
         while(True):
-            print('WAITING')
             request = queue.get()
-            print('GET REQUEST!')
-            request.run(self, queue)
-            print('REQUEST DONE!')
+            request.run(session, queue)
+
+            # Clobber any changes to the cookies
+            session.cookies = auth_cookies.copy()
+    except Exception as e:
+        print('ERROR: An agent has crashed!')
+        raise e
 
